@@ -7,7 +7,7 @@ import { MP4Demuxer } from '../demux/mp4-demuxer';
 import { MKVDemuxer } from '../demux/mkv-demuxer';
 import { TSDemuxer } from '../demux/ts-demuxer';
 import type { ByteSource } from '../utils/byte-source';
-import { openHttpByteSource } from '../utils/http-byte-source';
+import { guessNameFromUrl, openHttpByteSource } from '../utils/http-byte-source';
 
 export interface PlayerConfig {
   canvas: HTMLCanvasElement;
@@ -91,6 +91,7 @@ export class WebPlayer {
   private container?: HTMLElement;
   private useWebGPU = true;
   private renderer: Renderer | null = null;
+  private hideVideoCanvas = false;
   private clock = new MediaClock();
   private clockBaseTimestampUs = 0;
   private clockBaseWallClockMs = 0;
@@ -133,11 +134,20 @@ export class WebPlayer {
     this.container = config.container;
   }
 
+  private applyVideoCanvasVisibility() {
+    try {
+      this.canvas.style.opacity = this.hideVideoCanvas ? '0' : '1';
+    } catch {
+      // ignore
+    }
+  }
+
   setCanvas(canvas: HTMLCanvasElement) {
     if (this.canvas === canvas) return;
     this.canvas = canvas;
     this.renderer?.destroy();
     this.renderer = null;
+    this.applyVideoCanvasVisibility();
   }
 
   setContainer(container?: HTMLElement) {
@@ -153,6 +163,7 @@ export class WebPlayer {
       this.renderer = new Canvas2DRenderer();
     }
     await this.renderer.init(this.canvas);
+    this.applyVideoCanvasVisibility();
   }
 
   async loadFile(file: File) {
@@ -186,7 +197,7 @@ export class WebPlayer {
     await this.startVideoElementPipeline(file);
   }
 
-  async loadUrl(url: string) {
+  async loadUrl(url: string, options?: { originalUrl?: string }) {
     this.stop();
     if (!this.renderer) await this.init();
     this.resetInternalSubtitles();
@@ -194,16 +205,18 @@ export class WebPlayer {
     const canUseWebCodecs =
       typeof VideoDecoder !== 'undefined' && typeof EncodedVideoChunk !== 'undefined';
 
-    const cleaned = url.split('#')[0]?.split('?')[0] ?? url;
+    const originalUrl = options?.originalUrl ?? url;
+    const cleaned = originalUrl.split('#')[0]?.split('?')[0] ?? originalUrl;
     const lower = cleaned.toLowerCase();
     const isMp4 = lower.endsWith('.mp4');
-    const isMkv = lower.endsWith('.mkv') || lower.endsWith('.webm');
+    const isWebm = lower.endsWith('.webm');
+    const isMkv = lower.endsWith('.mkv') || isWebm;
     const isTs = lower.endsWith('.ts') || lower.endsWith('.m2ts') || lower.endsWith('.m2t');
 
     if (canUseWebCodecs && (isMp4 || isMkv || isTs)) {
       this.prewarmAudioContext();
       try {
-        const source = await openHttpByteSource(url);
+        const source = await openHttpByteSource(url, { name: guessNameFromUrl(originalUrl) });
         if (isMp4) await this.startWebCodecsDemuxerPipeline(source, new MP4Demuxer(), 'webcodecs-mp4');
         else if (isMkv) await this.startWebCodecsDemuxerPipeline(source, new MKVDemuxer(), 'webcodecs-mkv');
         else await this.startWebCodecsDemuxerPipeline(source, new TSDemuxer(), 'webcodecs-ts');
@@ -212,6 +225,14 @@ export class WebPlayer {
         // eslint-disable-next-line no-console
         console.warn('[WebPlayer] WebCodecs URL demux path failed; falling back.', e);
         this.teardownWebCodecsPipeline();
+
+        if (!isMp4 && !isWebm) {
+          const detail = e instanceof Error ? e.message : String(e);
+          throw new Error(
+            `WebCodecs 拉流失败：${detail}。\n` +
+              `MKV/TS 无法使用 <video> 回退播放，请确保源站支持 CORS + Range，或使用 Proxy（例如 /cors?url=）。`,
+          );
+        }
       }
     }
 
@@ -315,6 +336,8 @@ export class WebPlayer {
     if (!this.renderer) throw new Error('Renderer not initialized');
     this.pipeline = 'video-element';
     this.paused = false;
+    this.hideVideoCanvas = true;
+    this.applyVideoCanvasVisibility();
 
     const video = document.createElement('video');
     video.playsInline = true;
@@ -330,45 +353,30 @@ export class WebPlayer {
 
     const attachTarget = this.container ?? document.body;
     video.style.position = 'absolute';
-    video.style.width = '1px';
-    video.style.height = '1px';
-    video.style.opacity = '0';
+    (video.style as any).inset = '0';
+    video.style.width = '100%';
+    video.style.height = '100%';
+    video.style.objectFit = 'contain';
+    video.style.background = 'black';
     video.style.pointerEvents = 'none';
-    attachTarget.appendChild(video);
+    attachTarget.insertBefore(video, attachTarget.firstChild);
 
     await video.play();
     this.clock.start(0, this.wallClockMs());
-
-    const pump = () => {
-      if (!this.videoEl || !this.renderer) return;
-      this.renderer.render(this.videoEl);
-      if ('requestVideoFrameCallback' in this.videoEl) {
-        this.videoFrameCallbackId = (
-          this.videoEl as HTMLVideoElement & {
-            requestVideoFrameCallback: (
-              cb: (now: number, meta: VideoFrameCallbackMetadata) => void,
-            ) => number;
-          }
-        ).requestVideoFrameCallback(() => pump());
-      } else {
-        requestAnimationFrame(() => pump());
-      }
-    };
-
-    pump();
   }
 
   private async startVideoElementUrlPipeline(url: string) {
     if (!this.renderer) throw new Error('Renderer not initialized');
     this.pipeline = 'video-element';
     this.paused = false;
+    this.hideVideoCanvas = true;
+    this.applyVideoCanvasVisibility();
 
     const video = document.createElement('video');
     video.playsInline = true;
     video.muted = false;
     video.controls = false;
     video.preload = 'auto';
-    video.crossOrigin = 'anonymous';
 
     video.src = url;
 
@@ -377,36 +385,16 @@ export class WebPlayer {
 
     const attachTarget = this.container ?? document.body;
     video.style.position = 'absolute';
-    video.style.width = '1px';
-    video.style.height = '1px';
-    video.style.opacity = '0';
+    (video.style as any).inset = '0';
+    video.style.width = '100%';
+    video.style.height = '100%';
+    video.style.objectFit = 'contain';
+    video.style.background = 'black';
     video.style.pointerEvents = 'none';
-    attachTarget.appendChild(video);
+    attachTarget.insertBefore(video, attachTarget.firstChild);
 
     await video.play();
     this.clock.start(0, this.wallClockMs());
-
-    const pump = () => {
-      if (!this.videoEl || !this.renderer) return;
-      try {
-        this.renderer.render(this.videoEl);
-      } catch {
-        // Cross-origin videos without CORS will throw when drawn to canvas.
-      }
-      if ('requestVideoFrameCallback' in this.videoEl) {
-        this.videoFrameCallbackId = (
-          this.videoEl as HTMLVideoElement & {
-            requestVideoFrameCallback: (
-              cb: (now: number, meta: VideoFrameCallbackMetadata) => void,
-            ) => number;
-          }
-        ).requestVideoFrameCallback(() => pump());
-      } else {
-        requestAnimationFrame(() => pump());
-      }
-    };
-
-    pump();
   }
 
   private teardownVideoElementPipeline() {
@@ -441,6 +429,8 @@ export class WebPlayer {
     if (this.videoElObjectUrl) URL.revokeObjectURL(this.videoElObjectUrl);
     this.videoElObjectUrl = null;
     this.resetInternalSubtitles();
+    this.hideVideoCanvas = false;
+    this.applyVideoCanvasVisibility();
   }
 
   private async startWebCodecsMp4Pipeline(file: File) {
@@ -462,6 +452,8 @@ export class WebPlayer {
     if (!this.renderer) throw new Error('Renderer not initialized');
     this.pipeline = pipeline;
     this.paused = false;
+    this.hideVideoCanvas = false;
+    this.applyVideoCanvasVisibility();
     this.clockStarted = false;
     this.clockBaseTimestampUs = 0;
     this.clockBaseWallClockMs = 0;
@@ -763,6 +755,8 @@ export class WebPlayer {
     this.demuxerInstance = null;
 
     this.teardownAudioPipeline();
+    this.hideVideoCanvas = false;
+    this.applyVideoCanvasVisibility();
   }
 
   private resetInternalSubtitles() {

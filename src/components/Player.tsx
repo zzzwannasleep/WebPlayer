@@ -20,6 +20,7 @@ export default function Player() {
   const [embeddedSelectedId, setEmbeddedSelectedId] = createSignal<string | null>(null);
   const [subtitleMode, setSubtitleMode] = createSignal<'none' | 'external' | 'embedded'>('none');
   const [urlInput, setUrlInput] = createSignal<string>('');
+  const [urlProxy, setUrlProxy] = createSignal<string>('');
 
   let player: WebPlayer | null = null;
   let resizeObserver: ResizeObserver | null = null;
@@ -41,6 +42,13 @@ export default function Player() {
 
   onMount(async () => {
     try {
+      try {
+        const envDefault = (import.meta.env as any)?.VITE_URL_PROXY_PREFIX as string | undefined;
+        setUrlProxy(localStorage.getItem('webplayer:urlProxy') ?? envDefault ?? '');
+      } catch {
+        // ignore
+      }
+
       const activeCanvas = useWebGPU() ? canvasWebGPURef : canvas2DRef;
       if (!activeCanvas) throw new Error('Canvas not mounted');
       player = new WebPlayer({
@@ -134,7 +142,9 @@ export default function Player() {
     if (!url) return;
     setError(null);
     try {
-      await player.loadUrl(url);
+      const proxy = urlProxy().trim();
+      const finalUrl = proxy ? `${proxy}${encodeURIComponent(url)}` : url;
+      await player.loadUrl(finalUrl, { originalUrl: url });
       syncEmbeddedSubtitlesAfterLoad();
 
       setStatus('playing');
@@ -221,6 +231,24 @@ export default function Player() {
             >
               Open URL
             </button>
+          </label>
+          <label class="flex items-center gap-2 text-sm text-slate-300">
+            <span>Proxy(可选)</span>
+            <input
+              class="w-[28ch] rounded bg-slate-900 px-2 py-1 text-sm text-slate-200 placeholder:text-slate-500"
+              type="text"
+              placeholder="(optional) /cors?url="
+              value={urlProxy()}
+              onInput={(e) => {
+                const next = e.currentTarget.value;
+                setUrlProxy(next);
+                try {
+                  localStorage.setItem('webplayer:urlProxy', next);
+                } catch {
+                  // ignore
+                }
+              }}
+            />
           </label>
           <label class="flex items-center gap-2 text-sm text-slate-300">
             <input

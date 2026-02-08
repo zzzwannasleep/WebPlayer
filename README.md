@@ -13,7 +13,7 @@
 - MKV：`V_MPEG4/ISO/AVC` + `A_AAC`
 - TS/M2TS：H.264（stream_type `0x1B`）+ AAC（`0x0F`）
 
-如果解封装或 WebCodecs 不支持，会回退到隐藏的 `<video>` 解码，并渲染到 canvas。
+如果解封装或 WebCodecs 不支持，会回退到 `<video>` 元素播放（直接显示）。
 
 ## 开发
 
@@ -31,3 +31,10 @@ npm run dev
 1. 推送到 `main` 分支后，GitHub Actions 会执行构建并部署到 Pages：`.github/workflows/pages.yml`
 2. 在仓库 Settings → Pages → **Build and deployment** 中选择 **Source: GitHub Actions**
 3. 访问地址通常是：`https://<owner>.github.io/<repo>/`
+
+## URL 播放（CORS / Range）
+
+- MP4/WebM：WebCodecs 解封装失败时会自动回退到 `<video>` 直接播放（通常不需要 CORS）。
+- MKV/TS：需要 `fetch` 读取字节流做解封装，目标服务器必须允许 CORS，并支持/暴露 Range 相关响应头（`Accept-Ranges` / `Content-Range` / `Content-Length` 等）。纯前端无法绕过 CORS。
+- 如果你不控制视频源：可以用你自己的反向代理/同源转发（本地 Nginx/Caddy/Vite dev server 等），或用 Cloudflare Worker（见 `cloudflare/cors-proxy.ts`）。然后在页面的 `Proxy` 输入你的前缀（例如 `/cors?url=`；可留空）。
+- 安全提示：不要部署成全网开放代理；请通过 Worker 的 `ALLOWED_HOSTS` 变量做域名白名单。
