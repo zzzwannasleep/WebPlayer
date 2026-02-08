@@ -230,7 +230,7 @@ export class WebPlayer {
           const detail = e instanceof Error ? e.message : String(e);
           throw new Error(
             `WebCodecs 拉流失败：${detail}。\n` +
-              `MKV/TS 无法使用 <video> 回退播放，请确保源站支持 CORS + Range，或使用 Proxy（例如 /cors?url=）。`,
+              `MKV/TS 无法使用 <video> 回退播放，请确保源站支持 CORS + Range，或通过本地反向代理转为同源后再试。`,
           );
         }
       }
