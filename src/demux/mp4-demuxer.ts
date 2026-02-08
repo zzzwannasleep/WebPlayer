@@ -1,7 +1,5 @@
-import MP4BoxImport from 'mp4box';
+import { createFile } from 'mp4box';
 import type { ByteSource } from '../utils/byte-source';
-
-const MP4Box: any = (MP4BoxImport as any)?.default ?? MP4BoxImport;
 
 export interface Mp4VideoTrackInfo {
   id: number;
@@ -109,7 +107,7 @@ export class MP4Demuxer {
     this.stopped = false;
     this.source = file;
 
-    const mp4boxFile = MP4Box.createFile();
+    const mp4boxFile = createFile();
     this.mp4boxFile = mp4boxFile;
 
     this.readyPromise = new Promise((resolve, reject) => {
