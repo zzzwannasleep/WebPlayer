@@ -1,8 +1,9 @@
 import { MediaClock } from './clock';
 import { RingBuffer } from './buffer-manager';
+import { audioDataToAudioBuffer } from './webaudio';
 import { Canvas2DRenderer } from '../render/canvas2d-fallback';
 import { WebGPURenderer } from '../render/webgpu-renderer';
-import { MP4Demuxer } from '../demux/mp4-demuxer';
+import { MP4Demuxer, type Mp4AudioTrackInfo } from '../demux/mp4-demuxer';
 
 export interface PlayerConfig {
   canvas: HTMLCanvasElement;
@@ -17,6 +18,8 @@ export class WebPlayer {
   private useWebGPU = true;
   private renderer: Renderer | null = null;
   private clock = new MediaClock();
+  private clockBaseTimestampUs = 0;
+  private clockBaseWallClockMs = 0;
 
   private pipeline: 'none' | 'video-element' | 'webcodecs-mp4' = 'none';
 
@@ -29,6 +32,18 @@ export class WebPlayer {
   private encodedQueue: EncodedVideoChunk[] = [];
   private demuxEnded = false;
   private decodeFlushPromise: Promise<void> | null = null;
+
+  private audioContext: AudioContext | null = null;
+  private audioGain: GainNode | null = null;
+  private audioDecoder: AudioDecoder | null = null;
+  private encodedAudioQueue: EncodedAudioChunk[] = [];
+  private audioDemuxEnded = false;
+  private audioDecodeFlushPromise: Promise<void> | null = null;
+  private audioScheduledUntilSec = 0;
+  private audioSources = new Set<AudioBufferSourceNode>();
+  private waitingForAudioClock = false;
+  private webcodecsStartMs = 0;
+
   private frameQueue = new RingBuffer<VideoFrame>(8);
   private renderLoopRaf = 0;
   private clockStarted = false;
@@ -71,6 +86,7 @@ export class WebPlayer {
       file.type === 'video/mp4' || file.name.toLowerCase().endsWith('.mp4');
 
     if (canUseWebCodecs && isMp4) {
+      this.prewarmAudioContext();
       try {
         await this.startWebCodecsMp4Pipeline(file);
         return;
@@ -89,15 +105,29 @@ export class WebPlayer {
     if (this.pipeline === 'video-element') {
       this.videoEl?.play().catch(() => {});
     }
-    this.clock.resume();
-    if (this.pipeline === 'webcodecs-mp4') this.ensureWebCodecsRenderLoop();
+    if (this.pipeline === 'webcodecs-mp4') {
+      this.mp4Demuxer?.resumeExtraction();
+      this.audioContext?.resume().catch(() => {});
+      this.clock.resume(this.wallClockMs());
+      this.ensureWebCodecsRenderLoop();
+      this.pumpWebCodecsDecoder(this.demuxEnded);
+      this.pumpAudioDecoder(this.audioDemuxEnded);
+      return;
+    }
+    this.clock.resume(this.wallClockMs());
   }
 
   pause() {
     this.paused = true;
     if (this.pipeline === 'video-element') this.videoEl?.pause();
-    this.clock.pause();
-    if (this.pipeline === 'webcodecs-mp4') this.cancelWebCodecsRenderLoop();
+    if (this.pipeline === 'webcodecs-mp4') {
+      this.mp4Demuxer?.pauseExtraction();
+      this.audioContext?.suspend().catch(() => {});
+      this.clock.pause(this.wallClockMs());
+      this.cancelWebCodecsRenderLoop();
+      return;
+    }
+    this.clock.pause(this.wallClockMs());
   }
 
   stop() {
@@ -138,7 +168,7 @@ export class WebPlayer {
     attachTarget.appendChild(video);
 
     await video.play();
-    this.clock.start(0);
+    this.clock.start(0, this.wallClockMs());
 
     const pump = () => {
       if (!this.videoEl || !this.renderer) return;
@@ -197,16 +227,37 @@ export class WebPlayer {
     this.pipeline = 'webcodecs-mp4';
     this.paused = false;
     this.clockStarted = false;
-    this.clock.pause();
+    this.clockBaseTimestampUs = 0;
+    this.clockBaseWallClockMs = 0;
+    this.waitingForAudioClock = false;
+    this.webcodecsStartMs = performance.now();
 
     this.encodedQueue = [];
     this.demuxEnded = false;
     this.decodeFlushPromise = null;
     this.frameQueue.clear();
+    this.encodedAudioQueue = [];
+    this.audioDemuxEnded = false;
+    this.audioDecodeFlushPromise = null;
+    this.audioScheduledUntilSec = 0;
+    for (const source of this.audioSources) {
+      try {
+        source.stop();
+      } catch {
+        // ignore
+      }
+      try {
+        source.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+    this.audioSources.clear();
 
     const demuxer = new MP4Demuxer();
     await demuxer.open(file);
     const videoTrack = await demuxer.getPrimaryVideoTrack();
+    const audioTrack = await this.tryGetPrimaryAudioTrack(demuxer);
 
     const decoder = new VideoDecoder({
       output: (frame) => this.onDecodedVideoFrame(frame),
@@ -233,6 +284,65 @@ export class WebPlayer {
     this.mp4Demuxer = demuxer;
     this.videoDecoder = decoder;
 
+    if (audioTrack && this.canUseWebCodecsAudio()) {
+      try {
+        const sampleRate = audioTrack.sampleRate;
+        const channelCount = audioTrack.channelCount;
+        if (
+          !Number.isFinite(sampleRate) ||
+          sampleRate <= 0 ||
+          !Number.isFinite(channelCount) ||
+          channelCount <= 0
+        ) {
+          throw new Error('Audio track missing sampleRate/channelCount');
+        }
+
+        this.ensureAudioContext(sampleRate);
+
+        const audioDecoder = new AudioDecoder({
+          output: (data) => this.onDecodedAudioData(data),
+          error: (err) => this.onAudioDecoderError(err),
+        });
+
+        const audioConfig: AudioDecoderConfig = {
+          codec: audioTrack.codec,
+          sampleRate,
+          numberOfChannels: channelCount,
+          description: audioTrack.description,
+        };
+
+        const audioSupport = await AudioDecoder.isConfigSupported(audioConfig);
+        if (!audioSupport.supported) {
+          throw new Error(`AudioDecoder config not supported: ${audioTrack.codec}`);
+        }
+        audioDecoder.configure(audioSupport.config);
+        this.audioDecoder = audioDecoder;
+        this.waitingForAudioClock = true;
+        if (this.audioContext) this.audioScheduledUntilSec = this.audioContext.currentTime;
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn('[WebPlayer] Audio init failed; continuing without audio.', e);
+        this.teardownAudioPipeline();
+        this.audioDecoder = null;
+        this.waitingForAudioClock = false;
+      }
+    }
+
+    if (audioTrack) {
+      demuxer.startAudioExtraction(
+        audioTrack,
+        (chunk) => {
+          if (!this.audioDecoder) return;
+          this.encodedAudioQueue.push(chunk);
+          this.pumpAudioDecoder();
+        },
+        () => {
+          this.audioDemuxEnded = true;
+          this.pumpAudioDecoder(true);
+        },
+      );
+    }
+
     demuxer.startVideoExtraction(
       videoTrack,
       (chunk) => {
@@ -245,14 +355,13 @@ export class WebPlayer {
       },
     );
 
-    this.clock.resume();
+    this.audioContext?.resume().catch(() => {});
     this.ensureWebCodecsRenderLoop();
   }
 
   private onDecodedVideoFrame(frame: VideoFrame) {
-    if (!this.clockStarted) {
-      this.clock.start(frame.timestamp);
-      this.clockStarted = true;
+    if (!this.clockStarted && !this.waitingForAudioClock) {
+      this.startClock(frame.timestamp, this.wallClockMs());
     }
 
     if (!this.frameQueue.push(frame)) {
@@ -281,10 +390,7 @@ export class WebPlayer {
 
     const demuxer = this.mp4Demuxer;
     if (demuxer) {
-      const highWater = 120;
-      const lowWater = 40;
-      if (this.encodedQueue.length >= highWater) demuxer.pauseExtraction();
-      else if (this.encodedQueue.length <= lowWater) demuxer.resumeExtraction();
+      this.updateDemuxerBackpressure();
     }
 
     if (endOfStream && this.encodedQueue.length === 0 && !this.decodeFlushPromise) {
@@ -302,9 +408,26 @@ export class WebPlayer {
       if (this.paused) return;
       if (!this.renderer) return;
       if (this.pipeline !== 'webcodecs-mp4') return;
-      if (!this.clockStarted) return;
 
-      const nowUs = this.clock.nowUs();
+      if (
+        !this.clockStarted &&
+        this.waitingForAudioClock &&
+        performance.now() - this.webcodecsStartMs > 1000
+      ) {
+        const peek = this.frameQueue.peek();
+        if (peek) {
+          this.waitingForAudioClock = false;
+          this.startClock(peek.timestamp, this.wallClockMs());
+        }
+      }
+
+      if (!this.clockStarted) {
+        this.pumpWebCodecsDecoder(this.demuxEnded);
+        this.pumpAudioDecoder(this.audioDemuxEnded);
+        return;
+      }
+
+      const nowUs = this.clock.nowUs(this.wallClockMs());
       let rendered = false;
       while (true) {
         const next = this.frameQueue.peek();
@@ -318,6 +441,7 @@ export class WebPlayer {
       }
 
       if (rendered) this.pumpWebCodecsDecoder(this.demuxEnded);
+      this.pumpAudioDecoder(this.audioDemuxEnded);
     };
     this.renderLoopRaf = requestAnimationFrame(loop);
   }
@@ -342,6 +466,24 @@ export class WebPlayer {
     this.decodeFlushPromise = null;
     this.clockStarted = false;
     this.paused = false;
+    this.waitingForAudioClock = false;
+    this.encodedAudioQueue = [];
+    this.audioDemuxEnded = false;
+    this.audioDecodeFlushPromise = null;
+    this.audioScheduledUntilSec = 0;
+    for (const source of this.audioSources) {
+      try {
+        source.stop();
+      } catch {
+        // ignore
+      }
+      try {
+        source.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+    this.audioSources.clear();
 
     try {
       this.videoDecoder?.close();
@@ -352,5 +494,207 @@ export class WebPlayer {
 
     this.mp4Demuxer?.stop();
     this.mp4Demuxer = null;
+
+    this.teardownAudioPipeline();
+  }
+
+  private canUseWebCodecsAudio(): boolean {
+    return (
+      typeof AudioDecoder !== 'undefined' &&
+      typeof EncodedAudioChunk !== 'undefined' &&
+      typeof AudioContext !== 'undefined'
+    );
+  }
+
+  private prewarmAudioContext() {
+    if (!this.canUseWebCodecsAudio()) return;
+    try {
+      this.ensureAudioContext();
+      this.audioContext?.resume().catch(() => {});
+    } catch {
+      // ignore
+    }
+  }
+
+  private ensureAudioContext(preferredSampleRate?: number): AudioContext {
+    if (this.audioContext) return this.audioContext;
+    const ctx =
+      typeof preferredSampleRate === 'number'
+        ? new AudioContext({ sampleRate: preferredSampleRate })
+        : new AudioContext();
+    const gain = ctx.createGain();
+    gain.gain.value = 1;
+    gain.connect(ctx.destination);
+    this.audioContext = ctx;
+    this.audioGain = gain;
+    this.audioScheduledUntilSec = ctx.currentTime;
+    return ctx;
+  }
+
+  private teardownAudioPipeline() {
+    try {
+      this.audioDecoder?.close();
+    } catch {
+      // ignore
+    }
+    this.audioDecoder = null;
+
+    if (this.audioContext) {
+      const ctx = this.audioContext;
+      this.audioContext = null;
+      this.audioGain = null;
+      ctx.close().catch(() => {});
+    } else {
+      this.audioGain = null;
+    }
+  }
+
+  private wallClockMs(): number {
+    if (this.audioContext) return this.audioContext.currentTime * 1000;
+    return performance.now();
+  }
+
+  private startClock(timestampUs: number, wallClockMs: number) {
+    this.clock.start(timestampUs, wallClockMs);
+    this.clockStarted = true;
+    this.clockBaseTimestampUs = timestampUs;
+    this.clockBaseWallClockMs = wallClockMs;
+  }
+
+  private updateDemuxerBackpressure() {
+    const demuxer = this.mp4Demuxer;
+    if (!demuxer) return;
+    if (this.paused) {
+      demuxer.pauseExtraction();
+      return;
+    }
+    const highWater = 120;
+    const lowWater = 40;
+    if (
+      this.encodedQueue.length >= highWater ||
+      (this.audioDecoder && this.encodedAudioQueue.length >= highWater)
+    ) {
+      demuxer.pauseExtraction();
+    } else if (
+      this.encodedQueue.length <= lowWater &&
+      (!this.audioDecoder || this.encodedAudioQueue.length <= lowWater)
+    ) {
+      demuxer.resumeExtraction();
+    }
+  }
+
+  private pumpAudioDecoder(endOfStream = false) {
+    const decoder = this.audioDecoder;
+    if (!decoder) return;
+
+    const ctx = this.audioContext;
+    const maxBufferedSec = 2;
+    if (ctx) {
+      const bufferedSec = this.audioScheduledUntilSec - ctx.currentTime;
+      if (bufferedSec > maxBufferedSec) {
+        this.updateDemuxerBackpressure();
+        return;
+      }
+    }
+
+    const maxDecodeQueue = 8;
+    while (
+      this.encodedAudioQueue.length > 0 &&
+      decoder.decodeQueueSize < maxDecodeQueue
+    ) {
+      const chunk = this.encodedAudioQueue.shift();
+      if (!chunk) break;
+      decoder.decode(chunk);
+    }
+
+    this.updateDemuxerBackpressure();
+
+    if (
+      endOfStream &&
+      this.encodedAudioQueue.length === 0 &&
+      !this.audioDecodeFlushPromise
+    ) {
+      this.audioDecodeFlushPromise = decoder
+        .flush()
+        .then(() => {})
+        .catch(() => {});
+    }
+  }
+
+  private onDecodedAudioData(data: AudioData) {
+    const ctx = this.audioContext;
+    const gain = this.audioGain;
+    if (!ctx || !gain) {
+      data.close();
+      return;
+    }
+
+    try {
+      if (!this.clockStarted) {
+        const startDelaySec = 0.05;
+        const baseTimeSec = ctx.currentTime + startDelaySec;
+        this.startClock(data.timestamp, baseTimeSec * 1000);
+        this.waitingForAudioClock = false;
+        if (this.audioScheduledUntilSec < baseTimeSec) this.audioScheduledUntilSec = baseTimeSec;
+      }
+
+      const audioBuffer = audioDataToAudioBuffer(ctx, data);
+      if (audioBuffer.length === 0) return;
+
+      const baseTimeSec = this.clockBaseWallClockMs / 1000;
+      const idealStartSec =
+        baseTimeSec + (data.timestamp - this.clockBaseTimestampUs) / 1_000_000;
+
+      const minStartSec = Math.max(ctx.currentTime, this.audioScheduledUntilSec);
+      const offsetSec = Math.max(0, minStartSec - idealStartSec);
+      if (offsetSec >= audioBuffer.duration) return;
+
+      const startSec = idealStartSec + offsetSec;
+      const playDurSec = audioBuffer.duration - offsetSec;
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(gain);
+      source.onended = () => this.audioSources.delete(source);
+      this.audioSources.add(source);
+
+      try {
+        if (offsetSec > 0 || playDurSec < audioBuffer.duration) {
+          source.start(startSec, offsetSec, playDurSec);
+        } else {
+          source.start(startSec);
+        }
+      } catch {
+        // ignore
+      }
+
+      const idealEndSec = idealStartSec + audioBuffer.duration;
+      if (idealEndSec > this.audioScheduledUntilSec) this.audioScheduledUntilSec = idealEndSec;
+    } finally {
+      data.close();
+    }
+
+    this.pumpAudioDecoder(this.audioDemuxEnded);
+  }
+
+  private onAudioDecoderError(err: unknown) {
+    // eslint-disable-next-line no-console
+    console.error('[WebPlayer] AudioDecoder error', err);
+    this.waitingForAudioClock = false;
+    try {
+      this.audioDecoder?.close();
+    } catch {
+      // ignore
+    }
+    this.audioDecoder = null;
+    this.encodedAudioQueue = [];
+  }
+
+  private async tryGetPrimaryAudioTrack(demuxer: MP4Demuxer): Promise<Mp4AudioTrackInfo | null> {
+    try {
+      return await demuxer.getPrimaryAudioTrack();
+    } catch {
+      return null;
+    }
   }
 }

@@ -10,6 +10,16 @@ export interface Mp4VideoTrackInfo {
   description?: BufferSource;
 }
 
+export interface Mp4AudioTrackInfo {
+  id: number;
+  codec: string;
+  timescale: number;
+  sampleRate: number;
+  channelCount: number;
+  sampleCount: number;
+  description?: BufferSource;
+}
+
 export interface Mp4Sample {
   data: Uint8Array;
   is_sync: boolean;
@@ -39,12 +49,44 @@ function tryExtractDescription(track: any): BufferSource | undefined {
   );
 }
 
+function tryExtractAudioDescription(track: any): BufferSource | undefined {
+  return (
+    pickBufferSource(track?.description) ??
+    pickBufferSource(track?.esds) ??
+    pickBufferSource(track?.esds?.data) ??
+    pickBufferSource(track?.dOps) ??
+    pickBufferSource(track?.dfLa) ??
+    pickBufferSource(track?.alac) ??
+    pickBufferSource(track?.dac3) ??
+    pickBufferSource(track?.dec3)
+  );
+}
+
+type VideoExtractionTarget = {
+  track: Mp4VideoTrackInfo;
+  extracted: number;
+  ended: boolean;
+  onChunk: (chunk: EncodedVideoChunk) => void;
+  onEnd: () => void;
+};
+
+type AudioExtractionTarget = {
+  track: Mp4AudioTrackInfo;
+  extracted: number;
+  ended: boolean;
+  onChunk: (chunk: EncodedAudioChunk) => void;
+  onEnd: () => void;
+};
+
 export class MP4Demuxer {
   private mp4boxFile: any | null = null;
   private readyPromise: Promise<any> | null = null;
   private stopped = false;
   private extracting = false;
   private paused = false;
+  private onSamplesInstalled = false;
+  private videoTargets = new Map<number, VideoExtractionTarget>();
+  private audioTargets = new Map<number, AudioExtractionTarget>();
 
   constructor(private readonly chunkSize = 1024 * 1024) {}
 
@@ -94,6 +136,84 @@ export class MP4Demuxer {
     };
   }
 
+  async getPrimaryAudioTrack(): Promise<Mp4AudioTrackInfo> {
+    if (!this.readyPromise) throw new Error('Demuxer not opened');
+    const info = await this.readyPromise;
+    const track = info?.audioTracks?.[0];
+    if (!track) throw new Error('No audio track found');
+
+    const timescale = Number(track.timescale ?? track.track_timescale ?? info.timescale ?? 1);
+    const sampleRate = Number(track.audio?.sample_rate ?? track.sample_rate ?? track.sampleRate ?? 0);
+    const channelCount = Number(
+      track.audio?.channel_count ?? track.channel_count ?? track.channelCount ?? 0,
+    );
+    const sampleCount = Number(track.nb_samples ?? track.sample_count ?? 0);
+
+    return {
+      id: Number(track.id),
+      codec: String(track.codec),
+      timescale: Number.isFinite(timescale) && timescale > 0 ? timescale : 1,
+      sampleRate: Number.isFinite(sampleRate) ? sampleRate : 0,
+      channelCount: Number.isFinite(channelCount) ? channelCount : 0,
+      sampleCount: Number.isFinite(sampleCount) ? sampleCount : 0,
+      description: tryExtractAudioDescription(track),
+    };
+  }
+
+  private ensureOnSamplesHandler(mp4boxFile: any) {
+    if (this.onSamplesInstalled) return;
+    this.onSamplesInstalled = true;
+
+    mp4boxFile.onSamples = (id: number, _user: any, samples: Mp4Sample[]) => {
+      if (this.stopped) return;
+      const videoTarget = this.videoTargets.get(id);
+      if (videoTarget) {
+        videoTarget.extracted += samples.length;
+        for (const sample of samples) {
+          const chunk = new EncodedVideoChunk({
+            type: sample.is_sync ? 'key' : 'delta',
+            timestamp: toMicroseconds(sample.cts, videoTarget.track.timescale),
+            duration: toMicroseconds(sample.duration, videoTarget.track.timescale),
+            data: sample.data,
+          });
+          videoTarget.onChunk(chunk);
+        }
+        this.maybeEndVideo(videoTarget);
+        return;
+      }
+
+      const audioTarget = this.audioTargets.get(id);
+      if (!audioTarget) return;
+      audioTarget.extracted += samples.length;
+      for (const sample of samples) {
+        const chunk = new EncodedAudioChunk({
+          type: sample.is_sync ? 'key' : 'delta',
+          timestamp: toMicroseconds(sample.cts, audioTarget.track.timescale),
+          duration: toMicroseconds(sample.duration, audioTarget.track.timescale),
+          data: sample.data,
+        });
+        audioTarget.onChunk(chunk);
+      }
+      this.maybeEndAudio(audioTarget);
+    };
+  }
+
+  private maybeEndVideo(target: VideoExtractionTarget) {
+    if (target.ended) return;
+    if (target.track.sampleCount <= 0) return;
+    if (target.extracted < target.track.sampleCount) return;
+    target.ended = true;
+    target.onEnd();
+  }
+
+  private maybeEndAudio(target: AudioExtractionTarget) {
+    if (target.ended) return;
+    if (target.track.sampleCount <= 0) return;
+    if (target.extracted < target.track.sampleCount) return;
+    target.ended = true;
+    target.onEnd();
+  }
+
   startVideoExtraction(
     track: Mp4VideoTrackInfo,
     onChunk: (chunk: EncodedVideoChunk) => void,
@@ -102,33 +222,45 @@ export class MP4Demuxer {
     if (!this.mp4boxFile) throw new Error('Demuxer not opened');
     const mp4boxFile = this.mp4boxFile;
 
-    let extracted = 0;
-    let ended = false;
-    const maybeEnd = () => {
-      if (ended) return;
-      if (track.sampleCount > 0 && extracted < track.sampleCount) return;
-      ended = true;
-      onEnd();
+    this.extracting = true;
+    this.paused = false;
+
+    const target: VideoExtractionTarget = {
+      track,
+      extracted: 0,
+      ended: false,
+      onChunk,
+      onEnd,
     };
+    this.videoTargets.set(track.id, target);
+
+    this.ensureOnSamplesHandler(mp4boxFile);
+    mp4boxFile.setExtractionOptions(track.id, null, { nbSamples: 1 });
+    mp4boxFile.start();
+  }
+
+  startAudioExtraction(
+    track: Mp4AudioTrackInfo,
+    onChunk: (chunk: EncodedAudioChunk) => void,
+    onEnd: () => void,
+  ) {
+    if (!this.mp4boxFile) throw new Error('Demuxer not opened');
+    const mp4boxFile = this.mp4boxFile;
 
     this.extracting = true;
     this.paused = false;
 
-    mp4boxFile.setExtractionOptions(track.id, null, { nbSamples: 1 });
-    mp4boxFile.onSamples = (_id: number, _user: any, samples: Mp4Sample[]) => {
-      if (this.stopped) return;
-      extracted += samples.length;
-      for (const sample of samples) {
-        const chunk = new EncodedVideoChunk({
-          type: sample.is_sync ? 'key' : 'delta',
-          timestamp: toMicroseconds(sample.cts, track.timescale),
-          duration: toMicroseconds(sample.duration, track.timescale),
-          data: sample.data,
-        });
-        onChunk(chunk);
-      }
-      maybeEnd();
+    const target: AudioExtractionTarget = {
+      track,
+      extracted: 0,
+      ended: false,
+      onChunk,
+      onEnd,
     };
+    this.audioTargets.set(track.id, target);
+
+    this.ensureOnSamplesHandler(mp4boxFile);
+    mp4boxFile.setExtractionOptions(track.id, null, { nbSamples: 1 });
     mp4boxFile.start();
   }
 
@@ -136,6 +268,9 @@ export class MP4Demuxer {
     this.stopped = true;
     this.extracting = false;
     this.paused = false;
+    this.onSamplesInstalled = false;
+    this.videoTargets.clear();
+    this.audioTargets.clear();
     try {
       this.mp4boxFile?.stop();
     } catch {
