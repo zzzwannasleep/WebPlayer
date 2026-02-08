@@ -26,3 +26,8 @@ npm run dev
 
 - 技术方案：`docs/TECH_PLAN.md`
 
+## Demo（GitHub Pages）
+
+1. 推送到 `main` 分支后，GitHub Actions 会执行构建并部署到 Pages：`.github/workflows/pages.yml`
+2. 在仓库 Settings → Pages → **Build and deployment** 中选择 **Source: GitHub Actions**
+3. 访问地址通常是：`https://<owner>.github.io/<repo>/`

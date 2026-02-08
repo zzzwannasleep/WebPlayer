@@ -2,6 +2,9 @@ import { defineConfig, splitVendorChunkPlugin } from 'vite';
 import solid from 'vite-plugin-solid';
 
 export default defineConfig({
+  // GitHub Pages uses a sub-path like `/repo/`, so use a relative base to make
+  // built assets work regardless of where the site is hosted.
+  base: './',
   plugins: [solid(), splitVendorChunkPlugin()],
   build: {
     target: 'es2020',
@@ -23,4 +26,3 @@ export default defineConfig({
     exclude: ['@ffmpeg/ffmpeg'],
   },
 });
-

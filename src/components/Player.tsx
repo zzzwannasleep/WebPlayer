@@ -48,7 +48,15 @@ export default function Player() {
         container: containerRef,
       });
       await player.init({ useWebGPU: useWebGPU() });
-      player.setSubtitleCueHandler((cue) => subtitleRenderer.addCue(cue));
+      player.setSubtitleCueHandler((cue) => {
+        if (cue.kind === 'pgs') {
+          subtitleRenderer
+            .loadSup(cue.data)
+            .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+          return;
+        }
+        subtitleRenderer.addCue(cue);
+      });
       setStatus('ready');
 
       resizeCanvasToContainer();

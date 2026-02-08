@@ -19,7 +19,7 @@ export type InternalSubtitleTrack = {
   label: string;
 };
 
-export type SubtitleCue = {
+export type SubtitleCue =
   | {
       kind: 'text';
       startUs: number;
