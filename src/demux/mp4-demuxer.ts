@@ -1,4 +1,7 @@
-import MP4Box from 'mp4box.js';
+import MP4BoxImport from 'mp4box';
+import type { ByteSource } from '../utils/byte-source';
+
+const MP4Box: any = (MP4BoxImport as any)?.default ?? MP4BoxImport;
 
 export interface Mp4VideoTrackInfo {
   id: number;
@@ -32,10 +35,17 @@ function toMicroseconds(value: number, timescale: number): number {
   return Math.round((value * 1_000_000) / timescale);
 }
 
+function toArrayBufferCopy(view: ArrayBufferView): ArrayBuffer {
+  const u8 = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  const copy = new Uint8Array(u8.byteLength);
+  copy.set(u8);
+  return copy.buffer;
+}
+
 function pickBufferSource(value: unknown): BufferSource | undefined {
   if (!value) return undefined;
   if (value instanceof ArrayBuffer) return value;
-  if (ArrayBuffer.isView(value)) return value;
+  if (ArrayBuffer.isView(value)) return toArrayBufferCopy(value);
   return undefined;
 }
 
@@ -81,18 +91,23 @@ type AudioExtractionTarget = {
 export class MP4Demuxer {
   private mp4boxFile: any | null = null;
   private readyPromise: Promise<any> | null = null;
+  private readPromise: Promise<void> | null = null;
+  private source: ByteSource | null = null;
   private stopped = false;
   private extracting = false;
   private paused = false;
+  private resumeWaiters: Array<() => void> = [];
   private onSamplesInstalled = false;
   private videoTargets = new Map<number, VideoExtractionTarget>();
   private audioTargets = new Map<number, AudioExtractionTarget>();
+  private startScheduled = false;
 
   constructor(private readonly chunkSize = 1024 * 1024) {}
 
-  async open(file: File) {
+  async open(file: ByteSource) {
     this.stop();
     this.stopped = false;
+    this.source = file;
 
     const mp4boxFile = MP4Box.createFile();
     this.mp4boxFile = mp4boxFile;
@@ -102,16 +117,39 @@ export class MP4Demuxer {
       mp4boxFile.onError = (e: any) => reject(e instanceof Error ? e : new Error(String(e)));
     });
 
-    let offset = 0;
-    while (offset < file.size && !this.stopped) {
-      const slice = file.slice(offset, offset + this.chunkSize);
-      const buffer = await slice.arrayBuffer();
-      (buffer as any).fileStart = offset;
-      offset += buffer.byteLength;
-      mp4boxFile.appendBuffer(buffer);
-    }
+    this.readPromise = this.runReadLoop(file, mp4boxFile);
+    await this.readyPromise;
+  }
 
-    if (!this.stopped) mp4boxFile.flush();
+  private async runReadLoop(file: ByteSource, mp4boxFile: any) {
+    try {
+      let offset = 0;
+      while (offset < file.size && !this.stopped) {
+        await this.waitIfPaused();
+        const slice = file.slice(offset, offset + this.chunkSize);
+        const buffer = await slice.arrayBuffer();
+        (buffer as any).fileStart = offset;
+        offset += buffer.byteLength;
+        mp4boxFile.appendBuffer(buffer);
+      }
+
+      if (!this.stopped) mp4boxFile.flush();
+    } catch {
+      // ignore
+    }
+  }
+
+  private wakeAllResumeWaiters() {
+    const waiters = this.resumeWaiters;
+    if (waiters.length === 0) return;
+    this.resumeWaiters = [];
+    for (const w of waiters) w();
+  }
+
+  private async waitIfPaused() {
+    while (this.paused && !this.stopped) {
+      await new Promise<void>((resolve) => this.resumeWaiters.push(resolve));
+    }
   }
 
   async getPrimaryVideoTrack(): Promise<Mp4VideoTrackInfo> {
@@ -214,6 +252,20 @@ export class MP4Demuxer {
     target.onEnd();
   }
 
+  private scheduleStart() {
+    if (this.startScheduled) return;
+    this.startScheduled = true;
+    queueMicrotask(() => {
+      this.startScheduled = false;
+      if (this.stopped || this.paused || !this.extracting) return;
+      try {
+        this.mp4boxFile?.start();
+      } catch {
+        // ignore
+      }
+    });
+  }
+
   startVideoExtraction(
     track: Mp4VideoTrackInfo,
     onChunk: (chunk: EncodedVideoChunk) => void,
@@ -236,7 +288,7 @@ export class MP4Demuxer {
 
     this.ensureOnSamplesHandler(mp4boxFile);
     mp4boxFile.setExtractionOptions(track.id, null, { nbSamples: 1 });
-    mp4boxFile.start();
+    this.scheduleStart();
   }
 
   startAudioExtraction(
@@ -261,13 +313,20 @@ export class MP4Demuxer {
 
     this.ensureOnSamplesHandler(mp4boxFile);
     mp4boxFile.setExtractionOptions(track.id, null, { nbSamples: 1 });
-    mp4boxFile.start();
+    this.scheduleStart();
   }
 
   stop() {
     this.stopped = true;
     this.extracting = false;
     this.paused = false;
+    this.wakeAllResumeWaiters();
+    try {
+      this.source?.abort?.();
+    } catch {
+      // ignore
+    }
+    this.source = null;
     this.onSamplesInstalled = false;
     this.videoTargets.clear();
     this.audioTargets.clear();
@@ -278,6 +337,7 @@ export class MP4Demuxer {
     }
     this.mp4boxFile = null;
     this.readyPromise = null;
+    this.readPromise = null;
   }
 
   pauseExtraction() {
@@ -295,6 +355,7 @@ export class MP4Demuxer {
     try {
       this.mp4boxFile.start();
       this.paused = false;
+      this.wakeAllResumeWaiters();
     } catch {
       // ignore
     }

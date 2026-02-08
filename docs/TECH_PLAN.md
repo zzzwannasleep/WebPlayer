@@ -112,8 +112,7 @@ src/
     "solid-js": "^1.8.0",
     "tailwindcss": "^3.4.0",
     "ass-compiler": "^0.1.0",
-    "mp4box.js": "^0.5.0",
-    "ts-ebml": "^0.0.1",
+    "mp4box": "^2.1.1",
     "@ffmpeg/ffmpeg": "^0.12.0"
   },
   "devDependencies": {

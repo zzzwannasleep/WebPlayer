@@ -1,4 +1,4 @@
-declare module 'mp4box.js' {
+declare module 'mp4box' {
   const MP4Box: {
     createFile: () => any;
   };

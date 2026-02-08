@@ -86,7 +86,8 @@ export function audioDataToAudioBuffer(context: AudioContext, audioData: AudioDa
   const buffer = context.createBuffer(channels, frames, sampleRate);
   if (frames === 0) return buffer;
 
-  const { planar, base } = normalizeSampleFormat(audioData.format);
+  const format = audioData.format ?? 'f32-planar';
+  const { planar, base } = normalizeSampleFormat(format);
 
   if (planar) {
     for (let ch = 0; ch < channels; ch++) {
@@ -124,4 +125,3 @@ export function audioDataToAudioBuffer(context: AudioContext, audioData: AudioDa
 
   return buffer;
 }
-
