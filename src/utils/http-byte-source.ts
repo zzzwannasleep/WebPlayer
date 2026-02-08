@@ -86,29 +86,13 @@ async function probeHttp(url: string, signal: AbortSignal, options: HttpOpenOpti
   const retryCount = options.retryCount ?? 1;
   const retryDelayMs = options.retryDelayMs ?? 300;
 
-  // Prefer HEAD to avoid downloading body, but do NOT trust missing Accept-Ranges.
-  // Some servers support range requests without including Accept-Ranges in HEAD.
+  // Avoid HEAD for maximal compatibility (some servers/proxies close connections on HEAD).
+  // We'll probe with small GETs below instead.
   let headSize: number | null = null;
   let headType = '';
   let headExplicitNoRange = false;
-  try {
-    const head = await fetchWithRetry(
-      url,
-      { method: 'HEAD', signal, headers: baseHeaders, credentials, referrerPolicy },
-      retryCount,
-      retryDelayMs,
-    );
-    if (head.ok) {
-      headSize = tryGetLengthFromHeaders(head.headers);
-      headType = head.headers.get('Content-Type') ?? '';
-      const ar = head.headers.get('Accept-Ranges');
-      if (ar && !/\bbytes\b/i.test(ar)) headExplicitNoRange = true;
-    }
-  } catch {
-    // ignore
-  }
 
-  // If the server explicitly says it doesn't support byte ranges, skip the Range probe.
+  // Probe for byte-range support with a tiny Range request.
   if (!headExplicitNoRange) {
     try {
       const headers = new Headers(baseHeaders);
@@ -327,10 +311,21 @@ class HttpFullByteSource implements HttpByteSource {
 }
 
 export async function openHttpByteSource(url: string, options?: HttpOpenOptions): Promise<HttpByteSource> {
+  const isCrossOrigin = (() => {
+    try {
+      const u = new URL(url, window.location.href);
+      return u.origin !== window.location.origin;
+    } catch {
+      return true;
+    }
+  })();
+
   const opts: HttpOpenOptions = {
     ...options,
     retryCount: options?.retryCount ?? 1,
     retryDelayMs: options?.retryDelayMs ?? 300,
+    referrerPolicy:
+      options?.referrerPolicy ?? (isCrossOrigin ? 'no-referrer' : undefined),
   };
 
   const name = opts.name ?? guessNameFromUrl(url);
