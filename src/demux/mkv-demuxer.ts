@@ -298,8 +298,116 @@ function mapAudioCodec(codecId: string, codecPrivate: Uint8Array | null): { code
   return null;
 }
 
+type EbmlElementHeader = {
+  id: number;
+  size: number | null;
+  unknown: boolean;
+  dataStart: number;
+  dataEnd: number;
+};
+
+function yieldToMain(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+class StreamByteReader {
+  private buffer = new Uint8Array();
+  private cursor = 0;
+  private bufferStart = 0;
+
+  constructor(
+    private readonly file: ByteSource,
+    private readonly chunkSize = 1024 * 1024,
+  ) {}
+
+  get pos(): number {
+    return this.bufferStart + this.cursor;
+  }
+
+  private get available(): number {
+    return this.buffer.length - this.cursor;
+  }
+
+  seek(pos: number) {
+    const clamped = Math.max(0, Math.min(this.file.size, Math.floor(pos)));
+    const bufStart = this.bufferStart;
+    const bufEnd = this.bufferStart + this.buffer.length;
+    if (clamped >= bufStart && clamped <= bufEnd) {
+      this.cursor = clamped - bufStart;
+      return;
+    }
+
+    this.bufferStart = clamped;
+    this.buffer = new Uint8Array();
+    this.cursor = 0;
+  }
+
+  private append(chunk: Uint8Array) {
+    const unconsumed = this.buffer.subarray(this.cursor);
+    const combined = new Uint8Array(unconsumed.length + chunk.length);
+    combined.set(unconsumed, 0);
+    combined.set(chunk, unconsumed.length);
+    this.bufferStart += this.cursor;
+    this.buffer = combined;
+    this.cursor = 0;
+  }
+
+  async ensure(minBytes: number, maxEnd: number) {
+    const end = Math.max(this.pos, Math.min(this.file.size, Math.floor(maxEnd)));
+    const need = Math.max(0, Math.min(Math.floor(minBytes), end - this.pos));
+
+    while (this.available < need) {
+      const fetchStart = this.bufferStart + this.buffer.length;
+      if (fetchStart >= end) break;
+      const fetchEnd = Math.min(end, fetchStart + this.chunkSize);
+      if (fetchEnd <= fetchStart) break;
+      const buf = await this.file.slice(fetchStart, fetchEnd).arrayBuffer();
+      const chunk = new Uint8Array(buf);
+      if (chunk.length === 0) break;
+      this.append(chunk);
+    }
+  }
+
+  async readElementHeader(maxEnd: number): Promise<EbmlElementHeader | null> {
+    const end = Math.max(this.pos, Math.min(this.file.size, Math.floor(maxEnd)));
+    if (this.pos >= end) return null;
+
+    await this.ensure(1, end);
+    if (this.pos >= end) return null;
+
+    await this.ensure(Math.min(4, end - this.pos), end);
+    const idRes = readId(this.buffer, this.cursor);
+    if (!idRes) throw new Error(`Invalid EBML ID at offset ${this.pos}`);
+    this.cursor += idRes.length;
+
+    await this.ensure(Math.min(8, end - this.pos), end);
+    const sizeRes = readVint(this.buffer, this.cursor);
+    if (!sizeRes) throw new Error(`Invalid EBML size at offset ${this.pos}`);
+    this.cursor += sizeRes.length;
+
+    const size = sizeRes.unknown ? null : sizeRes.value;
+    const dataStart = this.pos;
+    const dataEnd = size === null ? end : Math.min(end, dataStart + size);
+
+    return { id: idRes.id, size, unknown: !!sizeRes.unknown, dataStart, dataEnd };
+  }
+
+  async readBytes(length: number, maxEnd: number): Promise<Uint8Array> {
+    const end = Math.max(this.pos, Math.min(this.file.size, Math.floor(maxEnd)));
+    const len = Math.max(0, Math.min(Math.floor(length), end - this.pos));
+    if (len <= 0) return new Uint8Array();
+
+    await this.ensure(len, end);
+    if (this.available < len) throw new Error(`Unexpected EOF at offset ${this.pos}`);
+
+    const out = this.buffer.subarray(this.cursor, this.cursor + len);
+    this.cursor += len;
+    return out;
+  }
+}
+
 export class MKVDemuxer {
-  private bytes: Uint8Array | null = null;
+  private file: ByteSource | null = null;
   private segmentStart = 0;
   private segmentEnd = 0;
   private timecodeScaleNs = 1_000_000;
@@ -332,9 +440,9 @@ export class MKVDemuxer {
   async open(file: ByteSource) {
     this.stop();
     this.stopped = false;
-    this.bytes = new Uint8Array(await file.arrayBuffer());
+    this.file = file;
     this.segmentStart = 0;
-    this.segmentEnd = this.bytes.length;
+    this.segmentEnd = file.size;
     this.timecodeScaleNs = 1_000_000;
     this.videoTrack = null;
     this.audioTrack = null;
@@ -345,23 +453,23 @@ export class MKVDemuxer {
     this.extractSubtitleTrack = null;
     this.pendingSubtitle = null;
 
-    this.parseSegmentAndTracks();
+    await this.parseSegmentAndTracks();
   }
 
   async getPrimaryVideoTrack(): Promise<MkvVideoTrackInfo> {
-    if (!this.bytes) throw new Error('Demuxer not opened');
+    if (!this.file) throw new Error('Demuxer not opened');
     if (!this.videoTrack) throw new Error('No supported video track found in MKV');
     return this.videoTrack;
   }
 
   async getPrimaryAudioTrack(): Promise<MkvAudioTrackInfo> {
-    if (!this.bytes) throw new Error('Demuxer not opened');
+    if (!this.file) throw new Error('Demuxer not opened');
     if (!this.audioTrack) throw new Error('No supported audio track found in MKV');
     return this.audioTrack;
   }
 
   async getSubtitleTracks(): Promise<MkvSubtitleTrackInfo[]> {
-    if (!this.bytes) throw new Error('Demuxer not opened');
+    if (!this.file) throw new Error('Demuxer not opened');
     return this.subtitleTracks;
   }
 
@@ -440,7 +548,12 @@ export class MKVDemuxer {
     this.extracting = false;
     this.paused = false;
     this.wakeAllResumeWaiters();
-    this.bytes = null;
+    try {
+      this.file?.abort?.();
+    } catch {
+      // ignore
+    }
+    this.file = null;
     this.onVideoChunk = null;
     this.onVideoEnd = null;
     this.onAudioChunk = null;
@@ -490,62 +603,67 @@ export class MKVDemuxer {
     });
   }
 
-  private parseSegmentAndTracks() {
-    const bytes = this.bytes;
-    if (!bytes) return;
+  private async parseSegmentAndTracks() {
+    const file = this.file;
+    if (!file) throw new Error('Demuxer not opened');
 
-    let pos = 0;
-    while (pos < bytes.length) {
-      const idRes = readId(bytes, pos);
-      if (!idRes) break;
-      pos += idRes.length;
-      const sizeRes = readVint(bytes, pos);
-      if (!sizeRes) break;
-      pos += sizeRes.length;
-      const size = sizeRes.unknown ? null : sizeRes.value;
-      const dataStart = pos;
-      const dataEnd = size === null ? bytes.length : Math.min(bytes.length, pos + size);
+    // Locate Segment element.
+    const rootReader = new StreamByteReader(file, 256 * 1024);
+    let segment: EbmlElementHeader | null = null;
+    let steps = 0;
 
-      if (idRes.id === EBML_ID_SEGMENT) {
-        this.segmentStart = dataStart;
-        this.segmentEnd = dataEnd;
+    while (rootReader.pos < file.size && !this.stopped) {
+      const header = await rootReader.readElementHeader(file.size);
+      if (!header) break;
+      if (header.id === EBML_ID_SEGMENT) {
+        segment = header;
         break;
       }
-      pos = dataEnd;
+      rootReader.seek(header.dataEnd);
+      steps += 1;
+      if (steps % 200 === 0) await yieldToMain();
     }
 
-    this.parseInfoAndTracks();
-  }
+    if (!segment) throw new Error('Invalid MKV: Segment element not found');
+    this.segmentStart = segment.dataStart;
+    this.segmentEnd = segment.dataEnd;
 
-  private parseInfoAndTracks() {
-    const bytes = this.bytes;
-    if (!bytes) return;
-    let pos = this.segmentStart;
-    const end = this.segmentEnd;
-
+    // Parse Info + Tracks within Segment.
+    const segReader = new StreamByteReader(file, 512 * 1024);
+    segReader.seek(this.segmentStart);
     const trackEntries: TrackEntryParsed[] = [];
+    let parsedInfo = false;
+    let parsedTracks = false;
+    steps = 0;
 
-    while (pos < end) {
-      const idRes = readId(bytes, pos);
-      if (!idRes) break;
-      pos += idRes.length;
-      const sizeRes = readVint(bytes, pos);
-      if (!sizeRes) break;
-      pos += sizeRes.length;
-      const size = sizeRes.unknown ? null : sizeRes.value;
-      const dataStart = pos;
-      const dataEnd = size === null ? end : Math.min(end, pos + size);
+    while (
+      segReader.pos < this.segmentEnd &&
+      !this.stopped &&
+      (!parsedInfo || !parsedTracks)
+    ) {
+      const header = await segReader.readElementHeader(this.segmentEnd);
+      if (!header) break;
 
-      if (idRes.id === EBML_ID_INFO) {
-        this.parseInfo(dataStart, dataEnd);
-      } else if (idRes.id === EBML_ID_TRACKS) {
-        this.parseTracks(dataStart, dataEnd, trackEntries);
+      if (header.id === EBML_ID_INFO && header.size !== null) {
+        const data = await segReader.readBytes(header.dataEnd - header.dataStart, header.dataEnd);
+        this.parseInfo(data, 0, data.length);
+        parsedInfo = true;
+      } else if (header.id === EBML_ID_TRACKS && header.size !== null) {
+        const data = await segReader.readBytes(header.dataEnd - header.dataStart, header.dataEnd);
+        this.parseTracks(data, 0, data.length, trackEntries);
+        parsedTracks = true;
+      } else {
+        segReader.seek(header.dataEnd);
       }
 
-      pos = dataEnd;
-      if (this.videoTrack && this.audioTrack) break;
+      steps += 1;
+      if (steps % 200 === 0) await yieldToMain();
     }
 
+    this.applyTrackEntries(trackEntries);
+  }
+
+  private applyTrackEntries(trackEntries: TrackEntryParsed[]) {
     // Pick primary tracks (first supported).
     const subtitleTracks: MkvSubtitleTrackInfo[] = [];
     for (const t of trackEntries) {
@@ -618,9 +736,7 @@ export class MKVDemuxer {
     this.subtitleTracks = subtitleTracks;
   }
 
-  private parseInfo(start: number, end: number) {
-    const bytes = this.bytes;
-    if (!bytes) return;
+  private parseInfo(bytes: Uint8Array, start: number, end: number) {
     let pos = start;
     while (pos < end) {
       const idRes = readId(bytes, pos);
@@ -641,9 +757,7 @@ export class MKVDemuxer {
     }
   }
 
-  private parseTracks(start: number, end: number, out: TrackEntryParsed[]) {
-    const bytes = this.bytes;
-    if (!bytes) return;
+  private parseTracks(bytes: Uint8Array, start: number, end: number, out: TrackEntryParsed[]) {
     let pos = start;
     while (pos < end) {
       const idRes = readId(bytes, pos);
@@ -657,16 +771,14 @@ export class MKVDemuxer {
       const dataEnd = size === null ? end : Math.min(end, pos + size);
 
       if (idRes.id === EBML_ID_TRACK_ENTRY) {
-        const parsed = this.parseTrackEntry(dataStart, dataEnd);
+        const parsed = this.parseTrackEntry(bytes, dataStart, dataEnd);
         if (parsed) out.push(parsed);
       }
       pos = dataEnd;
     }
   }
 
-  private parseTrackEntry(start: number, end: number): TrackEntryParsed | null {
-    const bytes = this.bytes;
-    if (!bytes) return null;
+  private parseTrackEntry(bytes: Uint8Array, start: number, end: number): TrackEntryParsed | null {
     let pos = start;
 
     let trackNumber: number | null = null;
@@ -707,11 +819,11 @@ export class MKVDemuxer {
       } else if (idRes.id === EBML_ID_DEFAULT_DURATION && size !== null && size > 0 && size <= 8) {
         defaultDurationNs = readUnsigned(bytes, dataStart, size);
       } else if (idRes.id === EBML_ID_VIDEO && size !== null) {
-        const v = this.parseVideo(dataStart, dataEnd);
+        const v = this.parseVideo(bytes, dataStart, dataEnd);
         if (typeof v.width === 'number') width = v.width;
         if (typeof v.height === 'number') height = v.height;
       } else if (idRes.id === EBML_ID_AUDIO && size !== null) {
-        const a = this.parseAudio(dataStart, dataEnd);
+        const a = this.parseAudio(bytes, dataStart, dataEnd);
         if (typeof a.sampleRate === 'number') sampleRate = a.sampleRate;
         if (typeof a.channels === 'number') channels = a.channels;
       }
@@ -742,9 +854,7 @@ export class MKVDemuxer {
     };
   }
 
-  private parseVideo(start: number, end: number): { width?: number; height?: number } {
-    const bytes = this.bytes;
-    if (!bytes) return {};
+  private parseVideo(bytes: Uint8Array, start: number, end: number): { width?: number; height?: number } {
     let pos = start;
     let width: number | undefined;
     let height: number | undefined;
@@ -769,9 +879,7 @@ export class MKVDemuxer {
     return { width, height };
   }
 
-  private parseAudio(start: number, end: number): { sampleRate?: number; channels?: number } {
-    const bytes = this.bytes;
-    if (!bytes) return {};
+  private parseAudio(bytes: Uint8Array, start: number, end: number): { sampleRate?: number; channels?: number } {
     let pos = start;
     let sampleRate: number | undefined;
     let channels: number | undefined;
@@ -799,37 +907,31 @@ export class MKVDemuxer {
   }
 
   private async runExtractLoop() {
-    const bytes = this.bytes;
-    if (!bytes) throw new Error('Demuxer not opened');
-    const end = this.segmentEnd;
-    let pos = this.segmentStart;
+    const file = this.file;
+    if (!file) throw new Error('Demuxer not opened');
+    const end = this.segmentEnd || file.size;
+    const reader = new StreamByteReader(file, 1024 * 1024);
+    reader.seek(this.segmentStart);
 
     let clusterTimecode = 0;
     let pendingVideo: { timestampUs: number; data: Uint8Array; key: boolean } | null = null;
 
     let steps = 0;
 
-    while (pos < end && !this.stopped) {
+    while (reader.pos < end && !this.stopped) {
       await this.waitIfPaused();
 
       const videoTrackNo = this.extractVideoTrackNo ?? this.videoTrack?.trackNumber ?? null;
       const audioTrackNo = this.extractAudioTrackNo ?? this.audioTrack?.trackNumber ?? null;
       const subtitleTrackNo = this.extractSubtitleTrackNo;
 
-      const idRes = readId(bytes, pos);
-      if (!idRes) break;
-      pos += idRes.length;
-      const sizeRes = readVint(bytes, pos);
-      if (!sizeRes) break;
-      pos += sizeRes.length;
-      const size = sizeRes.unknown ? null : sizeRes.value;
-      const dataStart = pos;
-      const dataEnd = size === null ? end : Math.min(end, pos + size);
+      const header = await reader.readElementHeader(end);
+      if (!header) break;
 
-      if (idRes.id === EBML_ID_CLUSTER) {
+      if (header.id === EBML_ID_CLUSTER) {
         const res = await this.parseCluster(
-          dataStart,
-          dataEnd,
+          reader,
+          header.dataEnd,
           clusterTimecode,
           videoTrackNo,
           audioTrackNo,
@@ -838,14 +940,14 @@ export class MKVDemuxer {
         );
         clusterTimecode = res.clusterTimecode;
         pendingVideo = res.pendingVideo;
+      } else {
+        reader.seek(header.dataEnd);
       }
-
-      pos = dataEnd;
 
       steps += 1;
       if (steps % 200 === 0) {
         // Yield to keep UI responsive.
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        await yieldToMain();
       }
     }
 
@@ -867,7 +969,7 @@ export class MKVDemuxer {
   }
 
   private async parseCluster(
-    start: number,
+    reader: StreamByteReader,
     end: number,
     prevClusterTimecode: number,
     videoTrackNo: number | null,
@@ -875,44 +977,37 @@ export class MKVDemuxer {
     subtitleTrackNo: number | null,
     pendingVideo: { timestampUs: number; data: Uint8Array; key: boolean } | null,
   ): Promise<{ clusterTimecode: number; pendingVideo: { timestampUs: number; data: Uint8Array; key: boolean } | null }> {
-    const bytes = this.bytes;
-    if (!bytes) return { clusterTimecode: prevClusterTimecode, pendingVideo };
-    let pos = start;
     let clusterTimecode = prevClusterTimecode;
     let steps = 0;
 
-    while (pos < end && !this.stopped) {
+    while (reader.pos < end && !this.stopped) {
       if (this.paused) await this.waitIfPaused();
 
-      const idRes = readId(bytes, pos);
-      if (!idRes) break;
-      pos += idRes.length;
-      const sizeRes = readVint(bytes, pos);
-      if (!sizeRes) break;
-      pos += sizeRes.length;
-      const size = sizeRes.unknown ? null : sizeRes.value;
-      const dataStart = pos;
-      const dataEnd = size === null ? end : Math.min(end, pos + size);
+      const header = await reader.readElementHeader(end);
+      if (!header) break;
 
-      if (idRes.id === EBML_ID_CLUSTER_TIMECODE && size !== null && size > 0 && size <= 8) {
-        clusterTimecode = readUnsigned(bytes, dataStart, size);
-      } else if (idRes.id === EBML_ID_SIMPLE_BLOCK && size !== null) {
-        pendingVideo = this.handleBlock(bytes.subarray(dataStart, dataEnd), clusterTimecode, videoTrackNo, audioTrackNo, subtitleTrackNo, pendingVideo, true, null);
-      } else if (idRes.id === EBML_ID_BLOCK_GROUP && size !== null) {
-        pendingVideo = await this.parseBlockGroup(dataStart, dataEnd, clusterTimecode, videoTrackNo, audioTrackNo, subtitleTrackNo, pendingVideo);
+      if (header.id === EBML_ID_CLUSTER_TIMECODE && header.size !== null && header.size > 0 && header.size <= 8) {
+        const v = await reader.readBytes(header.dataEnd - header.dataStart, header.dataEnd);
+        clusterTimecode = readUnsigned(v, 0, v.length);
+      } else if (header.id === EBML_ID_SIMPLE_BLOCK && header.size !== null) {
+        const block = await reader.readBytes(header.dataEnd - header.dataStart, header.dataEnd);
+        pendingVideo = this.handleBlock(block, clusterTimecode, videoTrackNo, audioTrackNo, subtitleTrackNo, pendingVideo, true, null);
+      } else if (header.id === EBML_ID_BLOCK_GROUP) {
+        pendingVideo = await this.parseBlockGroup(reader, header.dataEnd, clusterTimecode, videoTrackNo, audioTrackNo, subtitleTrackNo, pendingVideo);
+      } else {
+        reader.seek(header.dataEnd);
       }
 
-      pos = dataEnd;
-
       steps += 1;
-      if (steps % 400 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (steps % 400 === 0) await yieldToMain();
     }
 
+    reader.seek(end);
     return { clusterTimecode, pendingVideo };
   }
 
   private async parseBlockGroup(
-    start: number,
+    reader: StreamByteReader,
     end: number,
     clusterTimecode: number,
     videoTrackNo: number | null,
@@ -920,33 +1015,26 @@ export class MKVDemuxer {
     subtitleTrackNo: number | null,
     pendingVideo: { timestampUs: number; data: Uint8Array; key: boolean } | null,
   ) {
-    const bytes = this.bytes;
-    if (!bytes) return pendingVideo;
-    let pos = start;
     let durationTicks: number | null = null;
     let blockBytes: Uint8Array | null = null;
 
-    while (pos < end && !this.stopped) {
+    while (reader.pos < end && !this.stopped) {
       if (this.paused) await this.waitIfPaused();
 
-      const idRes = readId(bytes, pos);
-      if (!idRes) break;
-      pos += idRes.length;
-      const sizeRes = readVint(bytes, pos);
-      if (!sizeRes) break;
-      pos += sizeRes.length;
-      const size = sizeRes.unknown ? null : sizeRes.value;
-      const dataStart = pos;
-      const dataEnd = size === null ? end : Math.min(end, pos + size);
+      const header = await reader.readElementHeader(end);
+      if (!header) break;
 
-      if (idRes.id === EBML_ID_BLOCK_DURATION && size !== null && size > 0 && size <= 8) {
-        durationTicks = readUnsigned(bytes, dataStart, size);
-      } else if (idRes.id === EBML_ID_BLOCK && size !== null) {
-        blockBytes = bytes.subarray(dataStart, dataEnd);
+      if (header.id === EBML_ID_BLOCK_DURATION && header.size !== null && header.size > 0 && header.size <= 8) {
+        const v = await reader.readBytes(header.dataEnd - header.dataStart, header.dataEnd);
+        durationTicks = readUnsigned(v, 0, v.length);
+      } else if (header.id === EBML_ID_BLOCK && header.size !== null) {
+        blockBytes = await reader.readBytes(header.dataEnd - header.dataStart, header.dataEnd);
+      } else {
+        reader.seek(header.dataEnd);
       }
-      pos = dataEnd;
     }
 
+    reader.seek(end);
     if (blockBytes) {
       pendingVideo = this.handleBlock(blockBytes, clusterTimecode, videoTrackNo, audioTrackNo, subtitleTrackNo, pendingVideo, false, durationTicks);
     }
@@ -954,34 +1042,27 @@ export class MKVDemuxer {
   }
 
   private async extractPgsSupBytes(trackNo: number, isAborted: () => boolean): Promise<Uint8Array> {
-    const bytes = this.bytes;
-    if (!bytes) return new Uint8Array();
-
-    const end = this.segmentEnd;
-    let pos = this.segmentStart;
+    const file = this.file;
+    if (!file) return new Uint8Array();
+    const end = this.segmentEnd || file.size;
+    const reader = new StreamByteReader(file, 1024 * 1024);
+    reader.seek(this.segmentStart);
 
     let clusterTimecode = 0;
     const chunks: Uint8Array[] = [];
     let total = 0;
     let steps = 0;
 
-    while (pos < end && !this.stopped && !isAborted()) {
+    while (reader.pos < end && !this.stopped && !isAborted()) {
       if (this.paused) await this.waitIfPaused();
 
-      const idRes = readId(bytes, pos);
-      if (!idRes) break;
-      pos += idRes.length;
-      const sizeRes = readVint(bytes, pos);
-      if (!sizeRes) break;
-      pos += sizeRes.length;
-      const size = sizeRes.unknown ? null : sizeRes.value;
-      const dataStart = pos;
-      const dataEnd = size === null ? end : Math.min(end, pos + size);
+      const header = await reader.readElementHeader(end);
+      if (!header) break;
 
-      if (idRes.id === EBML_ID_CLUSTER) {
+      if (header.id === EBML_ID_CLUSTER) {
         const res = await this.collectPgsFromCluster(
-          dataStart,
-          dataEnd,
+          reader,
+          header.dataEnd,
           clusterTimecode,
           trackNo,
           chunks,
@@ -989,12 +1070,12 @@ export class MKVDemuxer {
         );
         clusterTimecode = res.clusterTimecode;
         total += res.addedBytes;
+      } else {
+        reader.seek(header.dataEnd);
       }
 
-      pos = dataEnd;
-
       steps += 1;
-      if (steps % 200 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (steps % 200 === 0) await yieldToMain();
     }
 
     if (total <= 0) return new Uint8Array();
@@ -1008,99 +1089,79 @@ export class MKVDemuxer {
   }
 
   private async collectPgsFromCluster(
-    start: number,
+    reader: StreamByteReader,
     end: number,
     prevClusterTimecode: number,
     trackNo: number,
     out: Uint8Array[],
     isAborted: () => boolean,
   ): Promise<{ clusterTimecode: number; addedBytes: number }> {
-    const bytes = this.bytes;
-    if (!bytes) return { clusterTimecode: prevClusterTimecode, addedBytes: 0 };
-    let pos = start;
     let clusterTimecode = prevClusterTimecode;
     let addedBytes = 0;
     let steps = 0;
 
-    while (pos < end && !this.stopped && !isAborted()) {
+    while (reader.pos < end && !this.stopped && !isAborted()) {
       if (this.paused) await this.waitIfPaused();
 
-      const idRes = readId(bytes, pos);
-      if (!idRes) break;
-      pos += idRes.length;
-      const sizeRes = readVint(bytes, pos);
-      if (!sizeRes) break;
-      pos += sizeRes.length;
-      const size = sizeRes.unknown ? null : sizeRes.value;
-      const dataStart = pos;
-      const dataEnd = size === null ? end : Math.min(end, pos + size);
+      const header = await reader.readElementHeader(end);
+      if (!header) break;
 
-      if (idRes.id === EBML_ID_CLUSTER_TIMECODE && size !== null && size > 0 && size <= 8) {
-        clusterTimecode = readUnsigned(bytes, dataStart, size);
-      } else if (idRes.id === EBML_ID_SIMPLE_BLOCK && size !== null) {
-        addedBytes += this.collectPgsFromBlock(
-          bytes.subarray(dataStart, dataEnd),
-          clusterTimecode,
-          trackNo,
-          out,
-        );
-      } else if (idRes.id === EBML_ID_BLOCK_GROUP && size !== null) {
+      if (header.id === EBML_ID_CLUSTER_TIMECODE && header.size !== null && header.size > 0 && header.size <= 8) {
+        const v = await reader.readBytes(header.dataEnd - header.dataStart, header.dataEnd);
+        clusterTimecode = readUnsigned(v, 0, v.length);
+      } else if (header.id === EBML_ID_SIMPLE_BLOCK && header.size !== null) {
+        const block = await reader.readBytes(header.dataEnd - header.dataStart, header.dataEnd);
+        addedBytes += this.collectPgsFromBlock(block, clusterTimecode, trackNo, out);
+      } else if (header.id === EBML_ID_BLOCK_GROUP) {
         const res = await this.collectPgsFromBlockGroup(
-          dataStart,
-          dataEnd,
+          reader,
+          header.dataEnd,
           clusterTimecode,
           trackNo,
           out,
           isAborted,
         );
         addedBytes += res.addedBytes;
+      } else {
+        reader.seek(header.dataEnd);
       }
 
-      pos = dataEnd;
-
       steps += 1;
-      if (steps % 400 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (steps % 400 === 0) await yieldToMain();
     }
 
+    reader.seek(end);
     return { clusterTimecode, addedBytes };
   }
 
   private async collectPgsFromBlockGroup(
-    start: number,
+    reader: StreamByteReader,
     end: number,
     clusterTimecode: number,
     trackNo: number,
     out: Uint8Array[],
     isAborted: () => boolean,
   ): Promise<{ addedBytes: number }> {
-    const bytes = this.bytes;
-    if (!bytes) return { addedBytes: 0 };
-    let pos = start;
     let blockBytes: Uint8Array | null = null;
     let steps = 0;
 
-    while (pos < end && !this.stopped && !isAborted()) {
+    while (reader.pos < end && !this.stopped && !isAborted()) {
       if (this.paused) await this.waitIfPaused();
 
-      const idRes = readId(bytes, pos);
-      if (!idRes) break;
-      pos += idRes.length;
-      const sizeRes = readVint(bytes, pos);
-      if (!sizeRes) break;
-      pos += sizeRes.length;
-      const size = sizeRes.unknown ? null : sizeRes.value;
-      const dataStart = pos;
-      const dataEnd = size === null ? end : Math.min(end, pos + size);
+      const header = await reader.readElementHeader(end);
+      if (!header) break;
 
-      if (idRes.id === EBML_ID_BLOCK && size !== null) {
-        blockBytes = bytes.subarray(dataStart, dataEnd);
+      if (header.id === EBML_ID_BLOCK && header.size !== null) {
+        blockBytes = await reader.readBytes(header.dataEnd - header.dataStart, header.dataEnd);
+      } else {
+        reader.seek(header.dataEnd);
       }
-      pos = dataEnd;
 
       steps += 1;
-      if (steps % 600 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (steps % 600 === 0) await yieldToMain();
     }
 
+    reader.seek(end);
     if (!blockBytes) return { addedBytes: 0 };
     const addedBytes = this.collectPgsFromBlock(blockBytes, clusterTimecode, trackNo, out);
     return { addedBytes };
@@ -1175,8 +1236,9 @@ export class MKVDemuxer {
     // - full "PG" packets (like .sup), or
     // - raw PGS segments (segment_type + segment_length + payload...) with MKV timestamps.
     if (payload.length >= 13 && payload[0] === 0x50 && payload[1] === 0x47) {
-      out.push(payload);
-      return payload.length;
+      const copy = payload.slice();
+      out.push(copy);
+      return copy.length;
     }
 
     let added = 0;
